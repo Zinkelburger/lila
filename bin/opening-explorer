@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+
+"""Run a local opening explorer for lila development, with variant support.
+
+lila's analysis board talks to an external service, lila-openingexplorer, at
+`explorer.endpoint` -- which conf/base.conf already points at localhost:9002.
+Nothing listens there in a fresh dev environment, so the explorer panel just
+fails. This builds that service, runs it, and fills it with real games from
+the monthly dumps on database.lichess.org.
+
+No lila changes are needed to explore a variant. ui/analyse forwards
+game.variant.key to the service untouched (explorer/explorerXhr.ts), and the
+service keys positions per variant, with a distinct zobrist salt each and
+crazyhouse pockets folded into the hash (src/model/key.rs). The Masters
+database is hidden off standard, which is correct -- there is no master OTB
+corpus for the variants.
+
+What is missing upstream is only data: lichess.org rebuilt its databases
+during the 2021 Rust rewrite and re-imported the standard dumps alone.
+
+Usage:
+  bin/opening-explorer setup                      build the service
+  bin/opening-explorer serve [--detach]           run it on :9002
+  bin/opening-explorer import crazyhouse          import every published month
+  bin/opening-explorer import all --months 24     recent months, every variant
+  bin/opening-explorer status                     per-variant progress
+  bin/opening-explorer check crazyhouse           query the start position
+  bin/opening-explorer compact                    reclaim space after a backfill
+  bin/opening-explorer stop                       stop the service
+
+Then open http://localhost:9663/analysis/crazyhouse and hit the explorer.
+You must be logged in: ExplorerCtrl.setNode() short-circuits to an empty
+result for anonymous users, so a logged-out board looks like it has no data.
+
+Environment:
+  EXPLORER_DIR    lila-openingexplorer checkout  (default ../lila-openingexplorer)
+  EXPLORER_DATA   dumps and RocksDB live here    (default ../lila-explorer-data)
+  EXPLORER_PORT   port lila and the browser use  (default 9002)
+  BACKEND_PORT    port the service itself binds  (default 9012)
+  LILA_ORIGIN     origin allowed through CORS    (default http://localhost:9663)
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import NoReturn
+
+LILA_DIR = Path(__file__).resolve().parent.parent
+EXPLORER_DIR = Path(os.environ.get("EXPLORER_DIR", LILA_DIR.parent / "lila-openingexplorer"))
+EXPLORER_DATA = Path(os.environ.get("EXPLORER_DATA", LILA_DIR.parent / "lila-explorer-data"))
+EXPLORER_PORT = int(os.environ.get("EXPLORER_PORT", 9002))
+BACKEND_PORT = int(os.environ.get("BACKEND_PORT", 9012))
+LILA_ORIGIN = os.environ.get("LILA_ORIGIN", "http://localhost:9663")
+
+DATABASE = "https://database.lichess.org"
+SERVER_BIN = EXPLORER_DIR / "target/release/lila-openingexplorer"
+IMPORT_BIN = EXPLORER_DIR / "import-pgn/target/release/import-lichess"
+CORS_SHIM = LILA_DIR / "bin/opening-explorer-cors.mjs"
+
+# Variants with monthly dumps on database.lichess.org. chess960 is deliberately
+# not in the default set: shakmaty resolves both "chess960" and "fromPosition"
+# to Variant::Chess (variant.rs), and src/model/key.rs has a salt for every
+# variant except Chess960, so chess960 games would merge into the standard
+# index rather than getting one of their own. That may well be what you want --
+# transpositions into standard theory would then merge for free -- but it is a
+# decision to make on purpose. Name it explicitly to import it.
+VARIANTS = ["crazyhouse", "antichess", "atomic", "threeCheck", "kingOfTheHill", "horde", "racingKings"]
+OPT_IN_VARIANTS = ["chess960"]
+
+DOWNLOAD_WORKERS = 3
+DOWNLOAD_LOOKAHEAD = 8  # months fetched ahead of the importer, to bound disk use
+
+
+# --- output -----------------------------------------------------------------
+
+BOLD, DIM, CYAN, RED, GREEN, OFF = "\033[1m", "\033[2m", "\033[36m", "\033[31m", "\033[32m", "\033[0m"
+_print_lock = threading.Lock()
+
+
+def log(msg: str, color: str = CYAN) -> None:
+    with _print_lock:
+        print(f"{color}[{time.strftime('%H:%M:%S')}]{OFF} {msg}", flush=True)
+
+
+def abort(msg: str) -> NoReturn:
+    print(f"{RED}[FATAL]{OFF} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+# --- layout -----------------------------------------------------------------
+
+
+def variant_dir(variant: str) -> Path:
+    return EXPLORER_DATA / variant
+
+
+def marker_dir(variant: str) -> Path:
+    return variant_dir(variant) / ".imported"
+
+
+def months(variant: str, refresh: bool = False) -> list[str]:
+    """Every published dump URL for a variant, newest first.
+
+    Cached, because status reads it and should not need the network. Importing
+    refreshes it: new months appear monthly, and a stale listing would make
+    this silently stop finding them.
+    """
+    listing = variant_dir(variant) / "list.txt"
+    if refresh or not listing.exists():
+        variant_dir(variant).mkdir(parents=True, exist_ok=True)
+        url = f"{DATABASE}/{variant}/list.txt"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as res:
+                listing.write_bytes(res.read())
+        except OSError as err:
+            abort(f"no dumps published for variant '{variant}' ({err})")
+    return [line for line in listing.read_text().split() if line.endswith(".pgn.zst")]
+
+
+def resolve_variants(names: list[str]) -> list[str]:
+    if names == ["all"]:
+        return VARIANTS
+    known = VARIANTS + OPT_IN_VARIANTS
+    for name in names:
+        if name not in known:
+            abort(f"unknown variant '{name}'. Known: {', '.join(known)}")
+    return names
+
+
+# --- service ----------------------------------------------------------------
+
+
+def backend_up() -> bool:
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/monitor", timeout=5).read()
+        return True
+    except OSError:
+        return False
+
+
+def require_built() -> None:
+    if not SERVER_BIN.exists() or not IMPORT_BIN.exists():
+        abort("not built yet -- run: bin/opening-explorer setup")
+
+
+def cargo_env() -> dict[str, str]:
+    env = dict(os.environ)
+    cargo_bin = Path.home() / ".cargo/bin"
+    if cargo_bin.is_dir():
+        env["PATH"] = f"{cargo_bin}:{env['PATH']}"
+    if Path("/usr/lib64/libclang.so").exists():
+        env.setdefault("LIBCLANG_PATH", "/usr/lib64")
+    # The checked-in .env carries jemalloc tuning the build expects.
+    dotenv = EXPLORER_DIR / ".env"
+    if dotenv.exists():
+        for line in dotenv.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
+    return env
+
+
+def cmd_setup(args: argparse.Namespace) -> None:
+    if not EXPLORER_DIR.exists():
+        log(f"cloning lila-openingexplorer into {EXPLORER_DIR}")
+        subprocess.run(
+            ["git", "clone", "https://github.com/lichess-org/lila-openingexplorer.git", str(EXPLORER_DIR)],
+            check=True,
+        )
+
+    env = cargo_env()
+    if not shutil.which("cargo", path=env["PATH"]):
+        abort("cargo not found. Install Rust: https://rustup.rs")
+
+    # rocksdb wants liburing headers for its io-uring feature. That is a tuning
+    # knob for lichess's production spinning-disk array; drop it rather than
+    # require a root package install just to get a dev instance running.
+    cargo_toml = EXPLORER_DIR / "Cargo.toml"
+    has_liburing = subprocess.run(["pkg-config", "--exists", "liburing"]).returncode == 0
+    if not has_liburing and '"io-uring", ' in cargo_toml.read_text():
+        log("liburing-devel missing; building rocksdb without io-uring")
+        cargo_toml.write_text(cargo_toml.read_text().replace('"io-uring", ', ""))
+
+    log("building the service (compiles rocksdb; expect ~15min the first time)")
+    subprocess.run(["cargo", "build", "--release"], cwd=EXPLORER_DIR, env=env, check=True)
+    log("building the importer")
+    subprocess.run(["cargo", "build", "--release"], cwd=EXPLORER_DIR / "import-pgn", env=env, check=True)
+    log("setup done", GREEN)
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    require_built()
+    if backend_up():
+        abort(f"something is already serving on :{BACKEND_PORT} -- run 'stop' first")
+    EXPLORER_DATA.mkdir(parents=True, exist_ok=True)
+
+    if args.detach:
+        # Own session, so it outlives the shell that started it.
+        out = (EXPLORER_DATA / "serve.log").open("a")
+        child = subprocess.Popen(
+            [sys.executable, __file__, "serve"],
+            stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        for _ in range(60):
+            if backend_up():
+                log(f"serving on :{EXPLORER_PORT} (pid {child.pid}, log {EXPLORER_DATA}/serve.log)", GREEN)
+                return
+            time.sleep(1)
+        abort(f"did not come up; see {EXPLORER_DATA}/serve.log")
+
+    log(f"service   127.0.0.1:{BACKEND_PORT}  (db: {EXPLORER_DATA}/_db)")
+    log(f"cors shim 127.0.0.1:{EXPLORER_PORT} (origin: {LILA_ORIGIN})")
+
+    shim = subprocess.Popen(
+        ["node", str(CORS_SHIM), "--listen", str(EXPLORER_PORT),
+         "--upstream", str(BACKEND_PORT), "--origin", LILA_ORIGIN]
+    )
+    env = cargo_env()
+    env.setdefault("EXPLORER_LOG", "lila_openingexplorer=info")
+    server = subprocess.Popen(
+        [str(SERVER_BIN), "--bind", f"127.0.0.1:{BACKEND_PORT}", "--lila", LILA_ORIGIN],
+        cwd=EXPLORER_DATA, env=env,
+    )
+    try:
+        server.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for proc in (shim, server):
+            proc.terminate()
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    stopped = False
+    for pattern in ("target/release/lila-openingexplorer", "opening-explorer-cors.mjs"):
+        if subprocess.run(["pkill", "-f", pattern]).returncode == 0:
+            stopped = True
+    log("stopped" if stopped else "nothing was running", GREEN if stopped else DIM)
+
+
+# --- import -----------------------------------------------------------------
+
+
+DOWNLOAD_ATTEMPTS = 4
+
+
+def download(url: str, dest: Path) -> None:
+    """Fetch to a process-unique temp name, then move into place atomically.
+
+    Retries on network errors: this runs unattended for hours, and a single
+    blip should not cost the whole backfill.
+    """
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+    tmp = dest.with_suffix(f".part{os.getpid()}")
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as res, tmp.open("wb") as out:
+                shutil.copyfileobj(res, out, length=1 << 20)
+            tmp.replace(dest)
+            return
+        except Exception as err:
+            # Deliberately broad. http.client.IncompleteRead and HTTPException
+            # are not OSError subclasses, and a truncated chunked response is
+            # exactly the sort of blip this loop exists to absorb.
+            tmp.unlink(missing_ok=True)
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            log(f"{dest.name}: {err} (retry {attempt}/{DOWNLOAD_ATTEMPTS - 1})", RED)
+            time.sleep(5 * attempt)
+
+
+_running_import: subprocess.Popen | None = None
+
+
+def _terminate_import(*_: object) -> NoReturn:
+    """Kill the importer child before dying.
+
+    Killing this process alone leaves import-lichess running and still writing
+    to the service, so a restart puts two importers on the same month. Bind
+    this to SIGTERM and SIGINT so `pkill -f opening-explorer` stays clean.
+    """
+    if _running_import and _running_import.poll() is None:
+        _running_import.terminate()
+        try:
+            _running_import.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _running_import.kill()
+    # os._exit, not sys.exit: SystemExit would unwind into the download pool's
+    # shutdown(wait=True), which blocks forever on fetchers parked in
+    # room.acquire(). Nothing here needs flushing that a signal should wait on.
+    os._exit(130)
+
+
+def import_one(path: Path) -> bool:
+    global _running_import
+    _running_import = subprocess.Popen(
+        [str(IMPORT_BIN), "--endpoint", f"http://127.0.0.1:{BACKEND_PORT}", str(path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    _, stderr = _running_import.communicate()
+    code = _running_import.returncode
+    _running_import = None
+    if code != 0:
+        log(f"import failed: {path.name}: {stderr.strip()[:200]}", RED)
+    return code == 0
+
+
+def import_variant(variant: str, limit: int | None) -> None:
+    urls = months(variant, refresh=True)
+    if limit:
+        urls = urls[:limit]
+    markers = marker_dir(variant)
+    markers.mkdir(parents=True, exist_ok=True)
+    pending = [u for u in urls if not (markers / Path(u).name).exists()]
+    if not pending:
+        log(f"{variant}: already complete ({len(urls)} months)", GREEN)
+        return
+
+    log(f"{BOLD}{variant}{OFF}: {len(pending)} of {len(urls)} months to go")
+    # Downloads run ahead of the importer, but only so far. Letting them run
+    # free is not a disk problem -- every variant's dumps together are ~35G --
+    # but the write burst starves the importer: a month that normally lands in
+    # ~80s took 8 minutes while a backlog was being fetched alongside it.
+    #
+    # Bounded, so that an unbalanced release raises here instead of silently
+    # inflating the permit count and letting the fetchers run away again.
+    room = threading.BoundedSemaphore(DOWNLOAD_LOOKAHEAD)
+
+    def fetch(url: str) -> Path | None:
+        """Never raises: a failed month is skipped, not fatal.
+
+        The bare `except Exception` is load-bearing rather than lazy. An
+        exception escaping here propagates out of future.result() below, the
+        loop stops releasing permits, and the workers still parked in
+        room.acquire() never wake -- so the pool's shutdown(wait=True) hangs
+        forever on the way out. A skipped month is recoverable; that is not.
+        """
+        room.acquire()
+        dest = variant_dir(variant) / Path(url).name
+        try:
+            download(url, dest)
+            return dest
+        except Exception as err:
+            log(f"{variant}: giving up on {dest.name}: {err}", RED)
+            return None
+
+    failed = 0
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [pool.submit(fetch, url) for url in pending]
+        for done, future in enumerate(futures, 1):
+            try:
+                # Inside the try: every acquired permit must be released, or
+                # the remaining fetchers block forever and shutdown hangs.
+                path = future.result()
+                if path is None:
+                    failed += 1
+                    continue
+                log(f"{variant}: importing {path.name}  ({done}/{len(pending)})")
+                if import_one(path):
+                    (markers / path.name).touch()
+                else:
+                    failed += 1
+            finally:
+                room.release()
+
+    if failed:
+        log(f"{variant}: done, {failed} month(s) failed -- rerun to retry them", RED)
+    else:
+        log(f"{variant}: done", GREEN)
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    require_built()
+    targets = resolve_variants(args.variants)
+    if not backend_up():
+        abort(f"no service on :{BACKEND_PORT} -- run: bin/opening-explorer serve --detach")
+    for variant in targets:
+        import_variant(variant, args.months)
+    log("all imports finished", GREEN)
+
+
+# --- reporting --------------------------------------------------------------
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    print(f"  service    {'up' if backend_up() else 'DOWN'} on :{BACKEND_PORT}, shim on :{EXPLORER_PORT}")
+    db = EXPLORER_DATA / "_db"
+    if db.exists():
+        size = sum(f.stat().st_size for f in db.rglob("*") if f.is_file())
+        print(f"  database   {human(size)} at {db}")
+    print()
+    print(f"  {'variant':<16}{'imported':>10}{'downloaded':>12}{'on disk':>10}")
+    for variant in VARIANTS + OPT_IN_VARIANTS:
+        vdir = variant_dir(variant)
+        if not vdir.exists():
+            continue
+        total = len(months(variant))
+        if not total:
+            continue
+        imported = len(list(marker_dir(variant).glob("*.zst"))) if marker_dir(variant).exists() else 0
+        dumps = list(vdir.glob("*.pgn.zst"))
+        on_disk = sum(f.stat().st_size for f in dumps)
+        bar = "complete" if imported == total else f"{100 * imported // total}%"
+        print(f"  {variant:<16}{f'{imported}/{total}':>10}{f'{len(dumps)}/{total}':>12}{human(on_disk):>10}  {bar}")
+
+
+def cmd_compact(args: argparse.Namespace) -> None:
+    """Force a full RocksDB compaction.
+
+    Bulk importing leaves a lot of uncompacted L0 data around -- expect the
+    database to sit near 7x the compressed PGN it came from mid-backfill,
+    against roughly 3x once settled. Worth running when a backfill finishes.
+    """
+    if not backend_up():
+        abort(f"no service on :{BACKEND_PORT}")
+    before = sum(f.stat().st_size for f in (EXPLORER_DATA / "_db").rglob("*") if f.is_file())
+    log(f"compacting {human(before)} -- this takes a while and blocks writes")
+    request = urllib.request.Request(f"http://127.0.0.1:{BACKEND_PORT}/compact", method="POST")
+    try:
+        urllib.request.urlopen(request, timeout=None).read()
+    except OSError as err:
+        abort(f"compaction failed: {err}")
+    after = sum(f.stat().st_size for f in (EXPLORER_DATA / "_db").rglob("*") if f.is_file())
+    log(f"compacted {human(before)} -> {human(after)}", GREEN)
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    query = urllib.parse.urlencode({
+        "variant": args.variant, "play": "", "moves": "8",
+        "topGames": "0", "recentGames": "0",
+    })
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{EXPLORER_PORT}/lichess?{query}", timeout=30) as res:
+            data = json.load(res)
+    except OSError as err:
+        abort(f"could not reach the explorer on :{EXPLORER_PORT} ({err})")
+
+    total = data["white"] + data["draws"] + data["black"]
+    print(f"  {args.variant}: {total:,} games at the start position")
+    if not total:
+        abort("nothing imported yet for this variant")
+    for move in data["moves"]:
+        n = move["white"] + move["draws"] + move["black"]
+        print(f"    {move['san']:>7}  {n:>10,}  {100 * n / total:5.1f}%")
+
+
+# --- entry point ------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="bin/opening-explorer",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("setup", help="build the explorer service").set_defaults(func=cmd_setup)
+
+    serve = sub.add_parser("serve", help="run the service and CORS shim")
+    serve.add_argument("--detach", action="store_true", help="run in the background")
+    serve.set_defaults(func=cmd_serve)
+
+    sub.add_parser("stop", help="stop the service").set_defaults(func=cmd_stop)
+
+    imp = sub.add_parser("import", help="download and import monthly dumps")
+    imp.add_argument("variants", nargs="+", metavar="VARIANT",
+                     help=f"one or more of: {', '.join(VARIANTS + OPT_IN_VARIANTS)}, or 'all'")
+    imp.add_argument("-m", "--months", type=int, default=None,
+                     help="only the N most recent months (default: every published month)")
+    imp.set_defaults(func=cmd_import)
+
+    sub.add_parser("status", help="per-variant progress").set_defaults(func=cmd_status)
+
+    sub.add_parser("compact", help="force RocksDB compaction to reclaim space").set_defaults(func=cmd_compact)
+
+    check = sub.add_parser("check", help="query the start position")
+    check.add_argument("variant", nargs="?", default="crazyhouse")
+    check.set_defaults(func=cmd_check)
+
+    args = parser.parse_args()
+    signal.signal(signal.SIGINT, _terminate_import)
+    signal.signal(signal.SIGTERM, _terminate_import)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
