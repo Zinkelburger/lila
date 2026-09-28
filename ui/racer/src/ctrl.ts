@@ -118,7 +118,8 @@ export default class RacerCtrl implements PuzCtrl {
 
   raceFull = () => this.data.players.length >= 10;
 
-  status = (): RaceStatus => (this.run.clock.started() ? (this.run.clock.flag() ? 'post' : 'racing') : 'pre');
+  // 'post' only once end() has run: the clock that detects the flag is only rendered while 'racing'
+  status = (): RaceStatus => (this.run.clock.started() ? (this.run.endAt ? 'post' : 'racing') : 'pre');
 
   isRacing = () => this.status() === 'racing';
 
@@ -143,15 +144,26 @@ export default class RacerCtrl implements PuzCtrl {
       : undefined;
 
   end = (): void => {
-    this.run.unfinishedId = this.run.current.puzzle.id;
-    this.pushToHistory(false); // add last unsolved puzzle
+    if (this.run.endAt) return;
+    this.run.endAt = getNow();
     this.setGround();
     this.redraw();
-    sound.end();
+    if (this.isPlayer()) sound.end();
     pubsub.emit('ply', 0); // restore resize handle
     $('body').toggleClass('playing'); // end zen
     this.redrawSlow();
     clearInterval(this.redrawInterval);
+  };
+
+  // the clock flagged with a puzzle still on the board
+  endNow = (): void => {
+    if (this.run.endAt) return;
+    // spectators run the same clock but never play: nothing to record
+    if (this.isPlayer()) {
+      this.run.unfinishedId = this.run.current.puzzle.id;
+      this.pushToHistory(false);
+    }
+    this.end();
   };
 
   canSkip = () => this.skipAvailable;
@@ -176,7 +188,8 @@ export default class RacerCtrl implements PuzCtrl {
   playUci = (uci: Uci): void => {
     const now = getNow();
     const puzzle = this.run.current;
-    if (puzzle.startAt + config.minFirstMoveTime > now) console.log('reverted!');
+    if (this.run.clock.flag()) this.endNow();
+    else if (puzzle.startAt + config.minFirstMoveTime > now) console.log('reverted!');
     else {
       this.run.moves++;
       this.promotion.cancel();
@@ -203,8 +216,7 @@ export default class RacerCtrl implements PuzCtrl {
         sound.wrong();
         this.run.errors++;
         this.run.combo.reset();
-        if (this.run.clock.flag()) this.end();
-        else if (!this.incPuzzle(false)) this.end();
+        if (!this.incPuzzle(false)) this.end();
       }
       this.redraw();
       this.redrawQuick();
