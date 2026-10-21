@@ -3,5 +3,5 @@ import * as view from './view/main';
 import * as winningChances from './winningChances';
 
 export type * from './types';
-export { useFirstEval, renderEval, sanIrreversible } from './util';
+export { useFirstEval, renderEval, sanIrreversible, downloadPercent } from './util';
 export { CevalCtrl, view, winningChances };

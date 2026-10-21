@@ -32,7 +32,7 @@ import stepwiseScroll from '@/view/stepwiseScroll';
 
 import type { CevalCtrl } from '../ctrl';
 import { type CevalHandler, type NodeEvals, CevalState } from '../types';
-import { renderEval } from '../util';
+import { downloadPercent, renderEval } from '../util';
 import { povChances } from '../winningChances';
 import { renderCevalSettings } from './settings';
 
@@ -197,7 +197,7 @@ export function renderCeval(ctrl: CevalHandler): VNode[] {
     else pearl = makePearl(h('icon.ddloader'));
     percent = node.outcome() ? 100 : 0;
   }
-  if (download) percent = Math.min(100, Math.round((100 * download.bytes) / download.total));
+  if (download) percent = downloadPercent(download);
   else if (ceval.search.indeterminate || (percent > 0 && !ceval.isComputing)) percent = 100;
 
   const progressBar: VNode | undefined =
@@ -491,6 +491,6 @@ function renderPvBoard(ctrl: CevalHandler): VNode | undefined {
 function loadingText(ctrl: CevalHandler): string {
   const d = ctrl.ceval.download;
   return d?.total
-    ? `Downloaded ${Math.round((d.bytes * 100) / d.total)}% of ${Math.round(d.total / 1000 / 1000)}MB`
+    ? `Downloaded ${downloadPercent(d)}% of ${Math.round(d.total / 1000 / 1000)}MB`
     : i18n.site.loadingEngine;
 }

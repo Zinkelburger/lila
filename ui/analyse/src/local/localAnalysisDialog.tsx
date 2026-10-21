@@ -2,6 +2,7 @@ import type { AcplChart, ChartGame } from 'chart';
 
 import { withEffect, type Prop } from 'lib';
 import { clamp } from 'lib/algo';
+import { downloadPercent } from 'lib/ceval';
 import { maxBrowserHash } from 'lib/ceval/engines/engines';
 import type { CustomSearch, BaseEngineInfo, EngineInfo } from 'lib/ceval/types';
 import { engineSelect, hashSetting, searchTicks } from 'lib/ceval/view/settings';
@@ -70,10 +71,10 @@ class LocalAnalysisDialog {
       this.updateDownloadStatus = (d: { bytes: number; total: number }) => {
         const downloadStatus = d.total
           ? i18n.localAnalysis.downloadingXofY(
-              Math.min(100, Math.round((d.bytes * 100) / d.total)) + '%',
+              downloadPercent(d) + '%',
               Math.round(d.total / 1000 / 1000) + 'MB',
             )
-          : `${i18n.site.loadingEngine} ${Math.round(d.bytes / 1000 / 1000)}MB`;
+          : i18n.site.loadingEngine;
         if (downloadStatus === this.status) return;
 
         this.status = downloadStatus;

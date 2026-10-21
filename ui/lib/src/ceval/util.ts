@@ -14,6 +14,10 @@ export function renderEval(e: number): string {
   return (e > 0 ? '+' : '') + e.toFixed(1);
 }
 
+// total is 0 when the size is unknown, e.g. for content-encoded responses
+export const downloadPercent = (d: { bytes: number; total: number }): number =>
+  d.total ? Math.min(100, Math.round((100 * d.bytes) / d.total)) : 0;
+
 export function sanIrreversible(variant: VariantKey, san: string): boolean {
   if (san.startsWith('O-O')) return true;
   if (variant === 'crazyhouse') return false;
